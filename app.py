@@ -1,4 +1,5 @@
 import os
+import io
 import math
 from datetime import datetime
 
@@ -17,11 +18,105 @@ st.markdown(
 )
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "buffer_grid_db.csv")
+SHELTER_DB_PATH = os.path.join(os.path.dirname(__file__), "shelters_db.csv")
+
+SHELTER_COLUMNS = [
+    "name", "address", "lat", "lon",
+    "flood_ok", "inland_ok", "surge_ok", "quake_ok",
+    "tsunami_ok", "fire_ok", "landslide_ok", "volcano_ok",
+]
+
+
+def read_csv_flexible(uploaded_file) -> pd.DataFrame:
+    """国のCSVはShift-JIS(cp932)で配布されることが多いため、複数エンコーディングを試す"""
+    raw = uploaded_file.read()
+    last_err = None
+    for enc in ["utf-8-sig", "cp932", "shift_jis", "utf-8"]:
+        try:
+            return pd.read_csv(io.BytesIO(raw), encoding=enc)
+        except Exception as e:
+            last_err = e
+    raise ValueError(f"CSVの読み込みに失敗しました（文字コード不明）: {last_err}")
+
+
+def map_shelter_columns(df: pd.DataFrame) -> dict:
+    """国土地理院フォーマットの列名ゆれを吸収するマッピング"""
+    cols = list(df.columns)
+
+    def find(*keywords):
+        for c in cols:
+            if all(k in str(c) for k in keywords):
+                return c
+        return None
+
+    def find_exact(name):
+        for c in cols:
+            if str(c).strip() == name:
+                return c
+        return None
+
+    return {
+        "name": find("施設") or find("場所名") or find("名称"),
+        "addr": find("住所"),
+        "lat": find("緯度"),
+        "lon": find("経度"),
+        "flood": find_exact("洪水"),
+        "inland": find("内水氾濫"),
+        "surge": find_exact("高潮"),
+        "quake": find_exact("地震"),
+        "tsunami": find_exact("津波"),
+        "fire": find("大規模な火事"),
+        "landslide": find("崖崩れ"),
+        "volcano": find("火山現象"),
+    }
+
+
+def normalize_shelters(df: pd.DataFrame):
+    """アップロードされた指定緊急避難場所CSVを、アプリ内共通の形式に正規化する"""
+    m = map_shelter_columns(df)
+    if not m["name"] or not m["lat"] or not m["lon"]:
+        return None, m
+
+    out = pd.DataFrame()
+    out["name"] = df[m["name"]]
+    out["address"] = df[m["addr"]] if m["addr"] else ""
+    out["lat"] = pd.to_numeric(df[m["lat"]], errors="coerce")
+    out["lon"] = pd.to_numeric(df[m["lon"]], errors="coerce")
+
+    def flag(key):
+        col = m[key]
+        if col is None:
+            return pd.Series([False] * len(df), index=df.index)
+        numeric = pd.to_numeric(df[col], errors="coerce")
+        return numeric == 1
+
+    out["flood_ok"] = flag("flood")
+    out["inland_ok"] = flag("inland")
+    out["surge_ok"] = flag("surge")
+    out["quake_ok"] = flag("quake")
+    out["tsunami_ok"] = flag("tsunami")
+    out["fire_ok"] = flag("fire")
+    out["landslide_ok"] = flag("landslide")
+    out["volcano_ok"] = flag("volcano")
+
+    out = out.dropna(subset=["lat", "lon"]).reset_index(drop=True)
+    return out, m
+
+
+def load_shelters() -> pd.DataFrame:
+    if os.path.exists(SHELTER_DB_PATH):
+        return pd.read_csv(SHELTER_DB_PATH)
+    return pd.DataFrame(columns=SHELTER_COLUMNS)
+
+
+def save_shelters(df: pd.DataFrame) -> None:
+    df.to_csv(SHELTER_DB_PATH, index=False)
+
 
 COLUMNS = [
     "name", "lat", "lon", "type", "region", "desc",
     "operator", "total_units", "vacant_units", "risk_level",
-    "structure_note", "osaka_district", "last_updated",
+    "structure_note", "osaka_district", "info_date", "last_updated",
 ]
 
 # 大阪府営住宅の「地区」ごとの浸水リスクの目安。
@@ -53,7 +148,7 @@ initial_data = [
         "type": "避難バッファ", "region": "大阪市内・近郊",
         "desc": "大規模な棟間隔と高台の構造。北千里・南千里エリアの堅固な一時退避拠点候補。",
         "operator": "UR都市機構", "total_units": 1200, "vacant_units": 85,
-        "risk_level": "低", "structure_note": "RC造・高台", "osaka_district": "",
+        "risk_level": "低", "structure_note": "RC造・高台", "osaka_district": "", "info_date": "",
     },
     {
         "name": "UR金剛団地（大阪・富田林）",
@@ -61,7 +156,7 @@ initial_data = [
         "type": "避難バッファ", "region": "大阪市内・近郊",
         "desc": "圧倒的な戸数とストックを持つ巨大団地。南大阪エリアの防災ハブとして機能。",
         "operator": "UR都市機構", "total_units": 5600, "vacant_units": 340,
-        "risk_level": "低", "structure_note": "RC造・丘陵地", "osaka_district": "",
+        "risk_level": "低", "structure_note": "RC造・丘陵地", "osaka_district": "", "info_date": "",
     },
     {
         "name": "UR清和台・多聞台・鈴蘭台エリア（兵庫）",
@@ -69,7 +164,7 @@ initial_data = [
         "type": "避難バッファ", "region": "兵庫・阪神間",
         "desc": "川西・神戸北側の高台に位置する安定した丘陵団地。水害リスクを完全に回避。",
         "operator": "UR都市機構", "total_units": 3100, "vacant_units": 210,
-        "risk_level": "低", "structure_note": "RC造・高台", "osaka_district": "",
+        "risk_level": "低", "structure_note": "RC造・高台", "osaka_district": "", "info_date": "",
     },
     {
         "name": "UR平城団地 / 中登美団地（奈良）",
@@ -77,7 +172,7 @@ initial_data = [
         "type": "避難バッファ", "region": "奈良エリア",
         "desc": "高の原・学研奈良登美ヶ丘周辺の堅固なニュータウンストック。地盤リスク極小。",
         "operator": "UR都市機構", "total_units": 2400, "vacant_units": 150,
-        "risk_level": "低", "structure_note": "RC造・台地", "osaka_district": "",
+        "risk_level": "低", "structure_note": "RC造・台地", "osaka_district": "", "info_date": "",
     },
     {
         "name": "住之江・南港周辺（大阪ゼロメートル低地）",
@@ -85,7 +180,7 @@ initial_data = [
         "type": "水害リスク", "region": "大阪市内・近郊",
         "desc": "抽水所停止・排水不良時に内水氾濫とマンホール噴出が懸念される高リスク帯。",
         "operator": "-", "total_units": 0, "vacant_units": 0,
-        "risk_level": "高", "structure_note": "ゼロメートル地帯", "osaka_district": "",
+        "risk_level": "高", "structure_note": "ゼロメートル地帯", "osaka_district": "", "info_date": "",
     },
     {
         "name": "淀川・大和川下流域の密集市街地",
@@ -93,7 +188,7 @@ initial_data = [
         "type": "衛生リスク", "region": "大阪市内・近郊",
         "desc": "インフラ停止・ゴミ処理逼迫時に二次汚染と環境悪化が直撃する脆弱エリア。",
         "operator": "-", "total_units": 0, "vacant_units": 0,
-        "risk_level": "中", "structure_note": "密集市街地", "osaka_district": "",
+        "risk_level": "中", "structure_note": "密集市街地", "osaka_district": "", "info_date": "",
     },
 ]
 
@@ -140,6 +235,9 @@ if "df_index" not in st.session_state:
     if "osaka_district" not in df_loaded.columns:
         df_loaded["osaka_district"] = ""
     st.session_state.df_index = df_loaded
+
+if "shelter_df" not in st.session_state:
+    st.session_state.shelter_df = load_shelters()
 
 df_all = st.session_state.df_index
 
@@ -218,6 +316,9 @@ with col_map:
         district_badge = district_risk_badge(row.get("osaka_district", ""))
         if district_badge:
             extra += f"<br>{district_badge}"
+        info_date = row.get("info_date", "")
+        if pd.notna(info_date) and str(info_date).strip():
+            extra += f"<br>📅 情報確認日: {info_date}"
         popup_html = (
             f"<b>{row['name']}</b><br><b>種別:</b> {row['type']}"
             f"<br><b>エリア:</b> {row['region']}<br>{row['desc']}{extra}"
@@ -253,6 +354,9 @@ with col_list:
             district_badge = district_risk_badge(row.get("osaka_district", ""))
             if district_badge:
                 st.caption(district_badge)
+            info_date = row.get("info_date", "")
+            if pd.notna(info_date) and str(info_date).strip():
+                st.caption(f"📅 情報確認日: {info_date}")
             st.caption(f"最終更新: {row.get('last_updated', '-')}")
             st.caption(f"緯度: {row['lat']} / 経度: {row['lon']}")
 
@@ -325,10 +429,21 @@ with col_dl:
         "「堺市（南区を除く）」「泉州北部」「泉州南部」のいずれかを入れると、"
         "浸水リスクの目安バッジが自動で表示されます（大阪府営住宅のみ対象）。"
     )
+    st.caption(
+        "info_date列（任意）に「YYYY-MM-DD」形式で、空室情報を確認した日付を"
+        "入れられます。列がない・空欄の場合は、右側でアップロード時に指定した日付が使われます。"
+    )
 
 with col_up:
     uploaded_file = st.file_uploader(
         "記入済みのCSVまたはExcelファイルをアップロード", type=["csv", "xlsx"]
+    )
+    info_date_input = st.date_input(
+        "この空室情報を確認した日付", value=datetime.now().date()
+    )
+    st.caption(
+        "サイトに表示されていた時点の日付を入れてください。"
+        "CSV自体に info_date 列があれば、そちらが優先されます。"
     )
 
 if uploaded_file is not None:
@@ -338,13 +453,20 @@ if uploaded_file is not None:
         else:
             new_rows = pd.read_csv(uploaded_file)
 
-        optional_cols = {"last_updated", "osaka_district"}
+        optional_cols = {"last_updated", "osaka_district", "info_date"}
         missing_cols = [c for c in COLUMNS if c not in new_rows.columns and c not in optional_cols]
         if missing_cols:
             st.error(f"次の列が見つかりません。テンプレートと同じ列名にしてください: {missing_cols}")
         else:
             if "osaka_district" not in new_rows.columns:
                 new_rows["osaka_district"] = ""
+            if "info_date" not in new_rows.columns:
+                new_rows["info_date"] = info_date_input.strftime("%Y-%m-%d")
+            else:
+                # CSVに info_date が空欄の行だけ、指定した日付で埋める
+                new_rows["info_date"] = new_rows["info_date"].fillna("").astype(str)
+                blank_mask = new_rows["info_date"].str.strip() == ""
+                new_rows.loc[blank_mask, "info_date"] = info_date_input.strftime("%Y-%m-%d")
             new_rows = new_rows[[c for c in COLUMNS if c != "last_updated"]].copy()
             new_rows["last_updated"] = datetime.now().strftime("%Y-%m-%d")
 
@@ -389,6 +511,7 @@ with st.form("add_index_form"):
         in_total_units = st.number_input("総戸数（バッファのみ）", min_value=0, value=0, step=1)
         in_vacant_units = st.number_input("空き戸数（バッファのみ）", min_value=0, value=0, step=1)
         in_risk_level = st.selectbox("リスク度（リスク地点のみ）", ["低", "中", "高"])
+        in_info_date = st.date_input("この情報を確認した日付", value=datetime.now().date())
 
     submitted = st.form_submit_button("インデックスに追加する")
 
@@ -406,6 +529,7 @@ with st.form("add_index_form"):
             "risk_level": in_risk_level,
             "structure_note": in_structure,
             "osaka_district": "" if in_osaka_district == "該当なし" else in_osaka_district,
+            "info_date": in_info_date.strftime("%Y-%m-%d"),
             "last_updated": datetime.now().strftime("%Y-%m-%d"),
         }])
         st.session_state.df_index = pd.concat(
@@ -414,3 +538,105 @@ with st.form("add_index_form"):
         save_db(st.session_state.df_index)
         st.success(f"【追加成功】空間インデックスに「{in_name}」を登録しました！")
         st.rerun()
+
+# --- 7. 指定緊急避難場所（災害種別 適否チェック） ---
+st.divider()
+st.subheader("🏫 指定緊急避難場所（災害種別 適否チェック）")
+st.markdown(
+    "国土地理院が公開している「指定緊急避難場所データ」を取り込み、"
+    "**その避難所が洪水・内水氾濫でも本当に使えるのか**をチェックします。"
+    "指定避難所は災害種別ごとに「適／不適」が国のルールで登録されており、"
+    "地震には使えても洪水には使えない場所（＝低地にある等）が実際に存在します。"
+)
+st.markdown(
+    "① 下記リンクから大阪府（または市町村別）のCSVをダウンロード → "
+    "② そのままここにアップロードするだけで取り込めます（列名の変更は不要です）。"
+)
+st.markdown("🔗 [国土地理院 指定緊急避難場所データ ダウンロードサイト](https://hinanmap.gsi.go.jp/hinanjocp/hinanbasho/koukaidate.html)")
+
+shelter_upload = st.file_uploader(
+    "指定緊急避難場所CSV（国土地理院フォーマット）をアップロード",
+    type=["csv"], key="shelter_uploader",
+)
+
+if shelter_upload is not None:
+    try:
+        raw_df = read_csv_flexible(shelter_upload)
+        normalized, colmap = normalize_shelters(raw_df)
+        if normalized is None:
+            st.error(
+                "施設名・緯度・経度に該当する列が見つかりませんでした。"
+                "国土地理院の公式CSVをそのままアップロードしてください。"
+            )
+        else:
+            st.markdown(f"**プレビュー（{len(normalized)}件を認識）**")
+            st.dataframe(
+                normalized[["name", "address", "flood_ok", "inland_ok", "quake_ok", "tsunami_ok"]],
+                use_container_width=True,
+            )
+            not_flood_safe = (~normalized["flood_ok"]) & (~normalized["inland_ok"])
+            st.warning(
+                f"⚠️ 洪水・内水氾濫のどちらにも「適」の指定がない避難所: "
+                f"{int(not_flood_safe.sum())} 件 / {len(normalized)} 件中"
+            )
+            if st.button("✅ この内容を避難場所データに登録する"):
+                st.session_state.shelter_df = pd.concat(
+                    [st.session_state.shelter_df, normalized[SHELTER_COLUMNS]],
+                    ignore_index=True,
+                )
+                save_shelters(st.session_state.shelter_df)
+                st.success(f"{len(normalized)}件の指定緊急避難場所を登録しました！")
+                st.rerun()
+    except Exception as e:
+        st.error(f"読み込み中にエラーが発生しました: {e}")
+
+shelter_df = st.session_state.shelter_df
+
+if not shelter_df.empty:
+    st.divider()
+    col_s1, col_s2, col_s3 = st.columns(3)
+    col_s1.metric("登録済み避難場所数", f"{len(shelter_df)} 件")
+    flood_unsafe = shelter_df[(~shelter_df["flood_ok"].astype(bool)) & (~shelter_df["inland_ok"].astype(bool))]
+    col_s2.metric("洪水×不適の避難所", f"{len(flood_unsafe)} 件")
+    col_s3.metric("洪水×適の避難所", f"{len(shelter_df) - len(flood_unsafe)} 件")
+
+    col_map2, col_list2 = st.columns([3, 2])
+
+    with col_map2:
+        st.markdown("**📍 避難場所マップ（赤＝洪水・内水氾濫では使えない）**")
+        m2 = folium.Map(location=[34.68, 135.50], zoom_start=10)
+        for _, row in shelter_df.iterrows():
+            is_flood_safe = bool(row.get("flood_ok")) or bool(row.get("inland_ok"))
+            color = "blue" if is_flood_safe else "darkred"
+            popup_html = (
+                f"<b>{row['name']}</b><br>{row.get('address', '')}"
+                f"<br>洪水: {'✅適' if row.get('flood_ok') else '❌不適'}"
+                f"<br>内水氾濫: {'✅適' if row.get('inland_ok') else '❌不適'}"
+                f"<br>津波: {'✅適' if row.get('tsunami_ok') else '❌不適'}"
+                f"<br>地震: {'✅適' if row.get('quake_ok') else '❌不適'}"
+            )
+            folium.Marker(
+                location=[row["lat"], row["lon"]],
+                popup=folium.Popup(popup_html, max_width=280),
+                tooltip=row["name"],
+                icon=folium.Icon(color=color, icon="home"),
+            ).add_to(m2)
+        st_folium(m2, width=550, height=420, key="shelter_map")
+
+    with col_list2:
+        st.markdown("**⚠️ 洪水・内水氾濫では使えない避難所一覧**")
+        if flood_unsafe.empty:
+            st.info("該当する避難所はありません（データ登録済みの範囲内では）。")
+        else:
+            for _, row in flood_unsafe.iterrows():
+                with st.expander(f"🔴 {row['name']}"):
+                    st.write(f"**住所:** {row.get('address', '-')}")
+                    st.caption(
+                        "この場所は洪水・内水氾濫の指定緊急避難場所として"
+                        "登録されていません。大雨・浸水時は別の避難先を検討してください。"
+                    )
+else:
+    st.info(
+        "まだ避難場所データが登録されていません。"
+        "上記のリンクから大阪府のCSVをダウンロードしてアップロードしてください。"
+    )
